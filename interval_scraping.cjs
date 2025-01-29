@@ -1,11 +1,16 @@
 require('dotenv').config();
+const express = require('express');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const nodemailer = require('nodemailer');
 const fs = require('fs');
 const mongoose = require('mongoose');
-
+const path= require('path')
 const Order = require('./models/order.cjs'); // Import the existing Order model
+// Import scrapeOrderDetails function from orderScraper.js
+const { scrapeOrderDetails } = require('./orderScraper.cjs'); 
+const { takeScreenshot, sendScreenshotEmail } = require('./screenshot.cjs');
+
 
 // Use the Puppeteer stealth plugin to avoid detection and lets see 
 puppeteer.use(StealthPlugin());
@@ -33,7 +38,7 @@ const sendEmail = async (subject, text, loginEmail, order) => {
     const mailOptions = {
         from: `"Uvotake" <${process.env.Email_User}>`,
         to: process.env.EMAIL_TO.trim(),
-        subject: `New Bid from UVOTAKE ${loginEmail.split('@')[0]}: ${subject}`,
+        subject: `New Order from UVOTAKE ${loginEmail.split('@')[0]}: ${subject}`,
         html: `
             <!DOCTYPE html>
             <html>
@@ -136,10 +141,7 @@ const sendEmail = async (subject, text, loginEmail, order) => {
                                     <th>Bid</th>
                                     <td>${order.bid || 'N/A'}</td>
                                 </tr>
-                                <tr>
-                                    <th>Link</th>
-                                    <td>${order.href || 'N/A'}</td>
-                                </tr>
+                                
                             </table>
                             <p class="quote">${text}</p>
                         </div>
@@ -160,47 +162,60 @@ const sendEmail = async (subject, text, loginEmail, order) => {
     });
 };
 
-// Function to scrape individual order page
-const scrapeOrderPage = async (page) => {
-    // Extract details from the individual order page
-    const details = await page.evaluate(() => {
-        const title = document.querySelector('.tooltip-title-order')?.textContent.trim() || 'N/A';
-        const instructions = document.querySelector('.tooltip-instruction-order')?.textContent.trim() || 'N/A';
-        const attachedFiles = document.querySelector('.tooltip-files-order')?.textContent.trim() || 'N/A';
-
-        return { title, instructions, attachedFiles };
-    });
-
-    // Click the "Take Order" button
+// Function to click the "Take Order" button
+const clickTakeOrderButton = async (page) => {
     try {
-        const takeOrderSelector = 'input.button.button--1[type="submit"][value="Take Order"]';
+        const takeOrderSelector = process.env.TAKE_ORDER_SELECTOR;  // Use the selector from .env
+        const placeBidSelector = process.env.PLACE_BID_SELECTOR; // Add the selector for the Place Bid button
 
-        console.log('Waiting for the "Take Order" button...');
-        await page.waitForSelector(takeOrderSelector, { timeout: 10000 });
+        console.log('Waiting for the button to load...');
 
+        // Wait for either the "Take Order" or "Place Bid" button to appear
+        await page.waitForSelector(takeOrderSelector, { timeout: 10000 }).catch(() => null); // Try "Take Order" first
+        await page.waitForSelector(placeBidSelector, { timeout: 10000 }).catch(() => null); // If not found, try "Place Bid"
+
+        // Check if the "Place Bid" button exists (skip if found)
+        const placeBidButton = await page.$(placeBidSelector);
+        if (placeBidButton) {
+            console.log('Found "Place Bid" button, skipping...');
+            return;  // Skip clicking if the "Place Bid" button is found
+        }
+
+        // If "Place Bid" isn't found, proceed with "Take Order"
         const takeOrderButton = await page.$(takeOrderSelector);
-
         if (takeOrderButton) {
-            console.log('Clicking the "Take Order" button...');
-            await page.click(takeOrderSelector);
-            console.log('"Take Order" button clicked successfully.');
+            // Check if the "Take Order" button is clickable
+            const buttonText = await page.evaluate(button => button.textContent, takeOrderButton);
+            if (buttonText.trim() === 'Take Order') {
+                console.log('Clicking the "Take Order" button...');
+                await takeOrderButton.click();
+                console.log('"Take Order" button clicked successfully.');
+            } else {
+                console.log('The button is not labeled as "Take Order".');
+            }
         } else {
             console.log('No "Take Order" button found.');
         }
+
     } catch (error) {
         console.error('Error clicking the "Take Order" button:', error.message);
     }
-
-    return details;
 };
+
 
 // Function to scrape orders from the main page
 const scrapeOrders = async (page) => {
     console.log('Scraping orders from the main page...');
-
+    
     // Locate all orders on the main page
     const orders = await page.evaluate(() => {
         return Array.from(document.querySelectorAll('.row[data-order_id]')).map(orderElement => {
+            // Check for the revision class <i class="revision"></i>
+            if (orderElement.querySelector('i.revision')) {
+                console.log('Skipping revision order...');
+                return null; 
+            }
+
             const orderId = orderElement.getAttribute('data-order_id');
             const topicTitle = orderElement.querySelector('.title-order')?.textContent.trim() || 'N/A';
             const discipline = orderElement.querySelector('.discipline-order')?.textContent.trim() || 'N/A';
@@ -209,7 +224,7 @@ const scrapeOrders = async (page) => {
             const deadline = new Date(orderElement.querySelector('.time-order span')?.textContent.trim()) || 'N/A';
             const cpp = parseFloat(orderElement.querySelector('.cpp-order')?.textContent.trim()) || 0;
             const cost = parseFloat(orderElement.querySelector('.cost-order')?.textContent.trim()) || 0;
-            const bid = parseFloat(orderElement.querySelector('.bid-order')?.textContent.trim()) || 0;
+            //const bid = parseFloat(orderElement.querySelector('.bid-order')?.textContent.trim()) || 0;
             const href = `https://www.uvocorp.com/order/${orderId}.html`;
 
             return {
@@ -221,24 +236,36 @@ const scrapeOrders = async (page) => {
                 deadline,
                 cost,
                 cpp,
-                bid,
+                //bid,
                 href,
+                isRevision: orderElement.querySelector('i.revision') !== null // Mark if order is a revision
             };
-        });
+        }).filter(order => order !== null); 
     });
 
-    // Iterate over each order to navigate and scrape details
     for (const order of orders) {
+        if (order.isRevision) {
+            console.log(`Skipping revision order with ID: ${order.OrderId}`);
+            continue;  // Skip revision orders
+        }
+
         console.log(`Navigating to order page: ${order.href}`);
         await page.goto(order.href, { waitUntil: 'domcontentloaded' });
+        
+        // Ensure the page is fully loaded before scraping
+        await page.waitForSelector('.order-details');  // Wait for an element that indicates the page is loaded
 
-        console.log('Scraping individual order page...');
-        const details = await scrapeOrderPage(page);
+        console.log('Scraping individual TAKE ORDER  order page...');
+        const details = await scrapeOrderDetails(page);
         order.title = details.title;
         order.instructions = details.instructions;
         order.attachedFiles = details.attachedFiles;
 
         console.log(`Scraped order details:`, details);
+
+        // Call the function to click the "Take Order" button
+        await clickTakeOrderButton(page);  // Click the "Take Order" button after scraping the details
+
 
         // Optionally, navigate back to the main orders page
         await page.goto('https://www.uvocorp.com/orders/available.html', { waitUntil: 'domcontentloaded' });
@@ -246,6 +273,8 @@ const scrapeOrders = async (page) => {
 
     return orders;
 };
+
+
 
 // MongoDB Connection
 mongoose.connect(process.env.MONGO_URIlocal, {
@@ -260,37 +289,59 @@ mongoose.connect(process.env.MONGO_URIlocal, {
 // Function to check for new orders and send notifications
 const checkForNewOrders = async (page) => {
     console.log('Checking for new orders...');
-
+    
     const orders = await scrapeOrders(page);
     console.log('Scraped order details:', orders);
 
+    const loginEmail = process.env.Email_User;  // Define loginEmail before using it
+    
     if (orders.length > 0) {
         fs.writeFileSync('orders_with_details.json', JSON.stringify(orders, null, 2));
         console.log('Order details saved to orders_with_details.json.');
 
         // Save orders to MongoDB
         for (const order of orders) {
-            const newOrder = new Order(order);
-            await newOrder.save();
-            console.log(`Order ${order.OrderId} saved to MongoDB.`);
+            try {
+                const newOrder = new Order(order);
+                await newOrder.save();
+                console.log(`Order ${order.OrderId} saved to MongoDB.`);
+            } catch (error) {
+                console.error(`Error saving order ${order.OrderId}:`, error.message);
+            }
         }
 
         // Send emails
         for (const order of orders) {
-            const subject = `New Bid Uvotake ${loginEmail.split('@')[0]}: ${order.OrderId}`;
+            const subject = `New Order Uvotake ${loginEmail.split('@')[0]}: ${order.OrderId}`;
             const text = `Order ID: ${order.OrderId}\nTopic Title: ${order.topicTitle}\nDiscipline: ${order.discipline}\nPages: ${order.pages}\nDeadline: ${order.deadline}\nCPP: ${order.cpp}\nCost: ${order.cost}`;
             await sendEmail(subject, text, loginEmail, order);
         }
     } else {
         console.log('No new orders found.');
+        // Wait for a few minutes before taking a screenshot
+        //await delay(3 * 60 * 1000); // 3 minutes delay
+        // Take a screenshot
+        // Dynamic path for screenshot
+        //const screenshotPath = path.join(__dirname, 'uvocorp_no_orders_screenshot.png');
+        //await takeScreenshot(page, screenshotPath);
+
+        // Send the screenshot email
+        //const subject = 'No New Orders Found - Screenshot';
+        //const loginEmail = process.env.Email_User;
+        //const text = 'No new orders were found after checking. Here is a screenshot of the page.';
+        //await sendScreenshotEmail(subject, text, loginEmail, screenshotPath);
     }
 };
 
+// Using dedlay promise in clicking enter using puppeteer
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 (async () => {
     const browser = await puppeteer.launch({
         headless: false,
         executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe',
-        timeout: 200000,
+        timeout: 400000,
         slowMo: 10,
         args: [
             '--no-sandbox',
@@ -330,7 +381,7 @@ const checkForNewOrders = async (page) => {
         console.log('Waiting for login form...');
         const loginEmailSelector = process.env.LOGIN_EMAIL_SELECTOR;
         const loginPasswordSelector = process.env.LOGIN_PASSWORD_SELECTOR;
-        const loginButtonSelector = process.env.LOGIN_BUTTON_SELECTOR;
+        //const loginButtonSelector = process.env.LOGIN_BUTTON_SELECTOR;
 
         await page.waitForSelector(loginEmailSelector);
 
@@ -340,9 +391,15 @@ const checkForNewOrders = async (page) => {
         console.log('Typing password...');
         await page.type(loginPasswordSelector, process.env.LOGIN_PASSWORD, { delay: randomDelay(150, 250) });
 
-        console.log('Clicking login button...');
-        await page.waitForSelector(loginButtonSelector);
-        await page.click(loginButtonSelector);
+        // console.log('Clicking login button...');
+        // await page.waitForSelector(loginButtonSelector);
+        // await page.click(loginButtonSelector);
+
+        console.log('Waiting for 5-10 seconds before pressing Enter...');
+        await delay (5000 + Math.floor(Math.random() * 5000));
+
+        console.log('Pressing Enter to submit the form...');
+        await page.keyboard.press('Enter'); // Simulate pressing the Enter key
 
         console.log('Waiting for you to manually solve the CAPTCHA and log in...');
         await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 0 });
@@ -350,10 +407,25 @@ const checkForNewOrders = async (page) => {
         console.log('Saving cookies...');
         await saveCookies(page, './cookies.json');
 
+        let isScraping = false;  // Add a flag to track scraping status
+
         setInterval(async () => {
-            console.log('Starting a new scrape cycle...');
-            await checkForNewOrders(page);
-        }, 300); // 2 seconds
+            if (!isScraping) {  // Check if the scraping cycle is already running
+                isScraping = true;  // Set the flag to true to prevent overlapping cycles
+                console.log('Starting a new scrape cycle...');
+                
+                try {
+                    await checkForNewOrders(page);  // Scrape new orders
+                } catch (error) {
+                    console.error('Error during scrape cycle:', error.message);
+                }
+        
+                isScraping = false;  // Reset the flag when the cycle finishes
+            } else {
+                console.log('Waiting for the current scrape cycle to finish...');
+            }
+        }, 600);  // 600ms interval
+        
 
     } catch (error) {
         console.error('Error during execution:', error.message);
